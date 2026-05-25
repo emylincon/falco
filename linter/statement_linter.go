@@ -112,25 +112,6 @@ func (l *Linter) lintDeclareStatement(stmt *ast.DeclareStatement, ctx *context.C
 		}
 		l.Error(err.Match(DECLARE_STATEMENT_DUPLICATED))
 	}
-
-	// Lint the value expression if present
-	if stmt.Value != nil {
-		// For BOOL type, Fastly only accepts simple forms:
-		// a single variable/literal, a function call, a parenthesized expression, or a sub call.
-		// A bare infix expression like "true == false" is not accepted — parentheses are required.
-		if vt == types.BoolType {
-			if _, ok := stmt.Value.(*ast.InfixExpression); ok {
-				err := &LintError{
-					Severity: ERROR,
-					Token:    stmt.Value.GetMeta().Token,
-					Message:  "Cannot use operator expression in BOOL declaration assignment without parentheses",
-				}
-				l.Error(err.Match(DECLARE_STATEMENT_SYNTAX))
-			}
-		}
-		l.lint(stmt.Value, ctx)
-	}
-
 	return types.NeverType
 }
 
@@ -142,16 +123,6 @@ func (l *Linter) lintSetStatement(stmt *ast.SetStatement, ctx *context.Context) 
 	// Check protected header will be modified
 	if isProtectedHTTPHeaderName(stmt.Ident.Value) {
 		l.Error(ProtectedHTTPHeader(stmt.Ident.GetMeta(), stmt.Ident.Value))
-	}
-
-	// Warn when overwriting Vary header entirely — the origin may have set
-	// important Vary values that would be discarded.
-	if stmt.Operator.Operator == "=" && isVaryHeader(stmt.Ident.Value) {
-		var subfield string
-		if s, ok := stmt.Value.(*ast.String); ok {
-			subfield = strings.TrimSpace(s.Value)
-		}
-		l.Error(OverwriteVary(stmt.Ident.GetMeta(), stmt.Ident.Value, subfield).Match(OVERWRITE_VARY))
 	}
 
 	left, err := ctx.Set(stmt.Ident.Value)
@@ -183,6 +154,28 @@ func (l *Linter) lintSetStatement(stmt *ast.SetStatement, ctx *context.Context) 
 	// See: https://docs.google.com/spreadsheets/d/16xRPugw9ubKA1nXHIc5ysVZKokLLhysI-jAu3qbOFJ8/edit#gid=0
 	switch stmt.Operator.Operator {
 	case "+=":
+		// Special string assignment - normally "+=" operator cannot use for STRING type,
+		// But the exception case that "+=" operation can use for the "req.hash".
+		// See: https://fiddle.fastly.dev/fiddle/0f3fc0aa
+		if stmt.Ident.Value == "req.hash" {
+			switch right {
+			// allows both variable and literal
+			case types.StringType, types.BoolType:
+				goto PASS
+			// allows variable only, disallow literal
+			case types.IntegerType, types.FloatType, types.RTimeType, types.TimeType, types.IPType, types.ReqBackendType:
+				if isLiteralExpression(stmt.Value) {
+					l.Error(InvalidTypeOperator(stmt.Operator.Meta, stmt.Operator.Operator, left, right).Match(OPERATOR_CONDITIONAL))
+				} else {
+					goto PASS
+				}
+			// disallow
+			default:
+				l.Error(InvalidTypeOperator(stmt.Operator.Meta, stmt.Operator.Operator, left, right).Match(OPERATOR_CONDITIONAL))
+			}
+			goto PASS
+		}
+
 		l.lintAddSubOperator(stmt.Operator, left, right, isLiteralExpression(stmt.Value))
 	case "-=":
 		l.lintAddSubOperator(stmt.Operator, left, right, isLiteralExpression(stmt.Value))
@@ -195,6 +188,7 @@ func (l *Linter) lintSetStatement(stmt *ast.SetStatement, ctx *context.Context) 
 	default: // "="
 		l.lintAssignOperator(stmt.Operator, stmt.Ident.Value, left, right, isLiteralExpression(stmt.Value))
 	}
+PASS:
 
 	return types.NeverType
 }
@@ -723,10 +717,131 @@ func (l *Linter) lintFunctionCallStatement(exp *ast.FunctionCallStatement, ctx *
 		return types.NeverType
 	}
 
-	return l.lintFunctionArguments(fn, functionMeta{
+	ret := l.lintFunctionArguments(fn, functionMeta{
 		name:      exp.Function.Value,
 		token:     exp.Function.GetMeta().Token,
 		arguments: exp.Arguments,
 		meta:      exp.Meta,
 	}, ctx)
+
+	// When the function has an Extra hook, invoke it for dynamic argument
+	// validation. If the first argument is a string literal, the hook
+	// resolves the referenced subroutine so we can validate the remaining
+	// arguments against its parameter signature.
+	if fn.Extra != nil && len(exp.Arguments) >= 1 {
+		if strLit, ok := exp.Arguments[0].(*ast.String); ok {
+			if sub, ok := fn.Extra(ctx, strLit.Value).(*types.Subroutine); ok && sub != nil {
+				l.lintExtraSubroutineArguments(exp, sub, ctx)
+			}
+		}
+	}
+
+	return ret
+}
+
+// lintExtraSubroutineArguments validates the extra arguments (beyond the first
+// subroutine-name argument) of testing.call_subroutine against the declared
+// parameters of the resolved subroutine.
+func (l *Linter) lintExtraSubroutineArguments(
+	exp *ast.FunctionCallStatement,
+	sub *types.Subroutine,
+	ctx *context.Context,
+) {
+	subName := exp.Arguments[0].(*ast.String).Value
+	extraArgs := exp.Arguments[1:]
+
+	if len(extraArgs) != len(sub.Decl.Parameters) {
+		l.Error(&LintError{
+			Severity: ERROR,
+			Token:    exp.Arguments[0].GetMeta().Token,
+			Message: fmt.Sprintf(
+				`subroutine "%s" expects %d argument(s), got %d`,
+				subName,
+				len(sub.Decl.Parameters),
+				len(extraArgs),
+			),
+		})
+		return
+	}
+
+	for i, param := range sub.Decl.Parameters {
+		arg := l.lint(extraArgs[i], ctx)
+		paramType, ok := types.ValueTypeMap[param.Type.Value]
+		if !ok {
+			continue
+		}
+		if coercible, ok := implicitCoersionTable[paramType]; ok {
+			if !expectType(arg, append(coercible, paramType)...) {
+				l.Error(FunctionArgumentTypeMismatch(
+					exp.Meta,
+					fmt.Sprintf("testing.call_subroutine(%q)", subName),
+					i+2,
+					paramType,
+					arg,
+				).Match(FUNCTION_ARGUMENT_TYPE))
+			}
+		} else if paramType != arg {
+			l.Error(FunctionArgumentTypeMismatch(
+				exp.Meta,
+				fmt.Sprintf("testing.call_subroutine(%q)", subName),
+				i+2,
+				paramType,
+				arg,
+			).Match(FUNCTION_ARGUMENT_TYPE))
+		}
+	}
+}
+
+// lintExtraSubroutineArgumentsExpr is the expression-call counterpart of
+// lintExtraSubroutineArguments. It validates the extra arguments of a
+// testing.call_subroutine expression against the resolved subroutine's
+// declared parameters.
+func (l *Linter) lintExtraSubroutineArgumentsExpr(
+	exp *ast.FunctionCallExpression,
+	sub *types.Subroutine,
+	ctx *context.Context,
+) {
+	subName := exp.Arguments[0].(*ast.String).Value
+	extraArgs := exp.Arguments[1:]
+
+	if len(extraArgs) != len(sub.Decl.Parameters) {
+		l.Error(&LintError{
+			Severity: ERROR,
+			Token:    exp.Arguments[0].GetMeta().Token,
+			Message: fmt.Sprintf(
+				`subroutine "%s" expects %d argument(s), got %d`,
+				subName,
+				len(sub.Decl.Parameters),
+				len(extraArgs),
+			),
+		})
+		return
+	}
+
+	for i, param := range sub.Decl.Parameters {
+		arg := l.lint(extraArgs[i], ctx)
+		paramType, ok := types.ValueTypeMap[param.Type.Value]
+		if !ok {
+			continue
+		}
+		if coercible, ok := implicitCoersionTable[paramType]; ok {
+			if !expectType(arg, append(coercible, paramType)...) {
+				l.Error(FunctionArgumentTypeMismatch(
+					exp.Meta,
+					fmt.Sprintf("testing.call_subroutine(%q)", subName),
+					i+2,
+					paramType,
+					arg,
+				).Match(FUNCTION_ARGUMENT_TYPE))
+			}
+		} else if paramType != arg {
+			l.Error(FunctionArgumentTypeMismatch(
+				exp.Meta,
+				fmt.Sprintf("testing.call_subroutine(%q)", subName),
+				i+2,
+				paramType,
+				arg,
+			).Match(FUNCTION_ARGUMENT_TYPE))
+		}
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/ysugimoto/falco/ast"
 	"github.com/ysugimoto/falco/linter/context"
 	"github.com/ysugimoto/falco/linter/types"
+	regexp "go.elara.ws/pcre"
 )
 
 func (l *Linter) lintIP(exp *ast.IP) types.Type {
@@ -296,24 +297,13 @@ func (l *Linter) lintInfixExpression(exp *ast.InfixExpression, ctx *context.Cont
 		}
 		// And, if right expression is STRING, regex must be valid
 		if v, ok := exp.Right.(*ast.String); ok {
-			if err := validateRegex(v.Value); err != nil {
+			if _, err := regexp.Compile(v.Value); err != nil {
 				err := &LintError{
 					Severity: ERROR,
 					Token:    exp.Right.GetMeta().Token,
 					Message:  "regex string is invalid, " + err.Error(),
 				}
 				l.Error(err)
-			}
-		}
-		// Check if regex is matching file extensions on req.url or req.url.path
-		if ident, ok := exp.Left.(*ast.Ident); ok {
-			if ident.Value == "req.url" || ident.Value == "req.url.path" {
-				if str, ok := exp.Right.(*ast.String); ok {
-					if exts := extractExtensionsFromRegex(str.Value); exts != nil {
-						suggestion := buildExtSuggestion(exp.Operator, exts)
-						l.Error(RegexUrlExtension(exp.GetMeta(), suggestion).Match(REGEX_URL_EXTENSION))
-					}
-				}
 			}
 		}
 		return types.BoolType
@@ -405,10 +395,29 @@ func (l *Linter) lintFunctionCallExpression(exp *ast.FunctionCallExpression, ctx
 		return types.NeverType
 	}
 
-	return l.lintFunctionArguments(fn, functionMeta{
+	l.lintFunctionArguments(fn, functionMeta{
 		name:      exp.Function.String(),
 		token:     exp.Function.GetMeta().Token,
 		arguments: exp.Arguments,
 		meta:      exp.Meta,
 	}, ctx)
+
+	// When the function has an Extra hook, invoke it to obtain the dynamic
+	// return type and to validate the subroutine arguments. If the first
+	// argument is a string literal that names a known subroutine, use the
+	// subroutine's declared ReturnType as the expression's result type.
+	if fn.Extra != nil && len(exp.Arguments) >= 1 {
+		if strLit, ok := exp.Arguments[0].(*ast.String); ok {
+			if sub, ok := fn.Extra(ctx, strLit.Value).(*types.Subroutine); ok && sub != nil {
+				l.lintExtraSubroutineArgumentsExpr(exp, sub, ctx)
+				if sub.Decl.ReturnType != nil {
+					if retType, ok := types.ValueTypeMap[sub.Decl.ReturnType.Value]; ok {
+						return retType
+					}
+				}
+			}
+		}
+	}
+
+	return fn.Return
 }

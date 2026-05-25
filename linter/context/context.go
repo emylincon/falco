@@ -21,7 +21,6 @@ var fastlyReservedSubroutines = map[string]bool{
 	"vcl_error":   true,
 	"vcl_deliver": true,
 	"vcl_log":     true,
-	"vcl_pipe":    true,
 }
 
 func IsFastlySubroutine(name string) bool {
@@ -94,6 +93,10 @@ func New(opts ...Option) *Context {
 	for i := range opts {
 		opts[i](c)
 	}
+
+	// Register testing-specific builtin functions (e.g. testing.call_subroutine)
+	addTestingFunctions(c)
+
 	return c
 }
 
@@ -364,6 +367,43 @@ func (c *Context) AddUserDefinedFunction(name string, scopes int, returnType typ
 	c.Subroutines[name] = sub
 
 	return nil
+}
+
+// AddFunction registers a builtin function in the linter context, supporting
+// dotted names like "testing.call_subroutine" by creating the necessary nested
+// FunctionSpec structure automatically.
+func (c *Context) AddFunction(name string, fn *BuiltinFunction) {
+	first, remains := splitName(name)
+
+	obj, ok := c.functions[first]
+	if !ok {
+		obj = &FunctionSpec{
+			Items: map[string]*FunctionSpec{},
+		}
+		c.functions[first] = obj
+	}
+
+	// Traverse/create the nested path, stopping before the last segment
+	for i := 0; i < len(remains)-1; i++ {
+		child, ok := obj.Items[remains[i]]
+		if !ok {
+			child = &FunctionSpec{
+				Items: map[string]*FunctionSpec{},
+			}
+			obj.Items[remains[i]] = child
+		}
+		obj = child
+	}
+
+	if len(remains) > 0 {
+		lastKey := remains[len(remains)-1]
+		obj.Items[lastKey] = &FunctionSpec{
+			Items: map[string]*FunctionSpec{},
+			Value: fn,
+		}
+	} else {
+		obj.Value = fn
+	}
 }
 
 func (c *Context) AddPenaltybox(name string, penaltybox *types.Penaltybox) error {

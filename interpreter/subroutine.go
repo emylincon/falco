@@ -354,10 +354,44 @@ func (i *Interpreter) validateAndSetParameters(sub *ast.SubroutineDeclaration, a
 				arg.Type(),
 			)
 		}
-		i.localVars[param.Name.Value] = converted
+		// Subroutine parameters are variables, not literals. Strip the
+		// literal flag so that operators like regex match (~) which reject
+		// literal strings on the left-hand side work correctly.
+		i.localVars[param.Name.Value] = clearLiteral(converted)
 	}
 
 	return nil
+}
+
+// clearLiteral returns a copy of the value with the Literal flag set to false.
+// This is used when storing argument values as subroutine local variables,
+// because parameters should behave as variables (e.g. usable on the left side
+// of a regex match) rather than as literals.
+func clearLiteral(v value.Value) value.Value {
+	c := v.Copy()
+	switch t := c.(type) {
+	case *value.String:
+		t.Literal = false
+	case *value.Integer:
+		t.Literal = false
+	case *value.Float:
+		t.Literal = false
+	case *value.Boolean:
+		t.Literal = false
+	case *value.IP:
+		t.Literal = false
+	case *value.RTime:
+		t.Literal = false
+	case *value.Ident:
+		t.Literal = false
+	case *value.Backend:
+		t.Literal = false
+	case *value.Acl:
+		t.Literal = false
+	case *value.Regex:
+		t.Literal = false
+	}
+	return c
 }
 
 // convertValueToType attempts to convert a value to the expected type using implicit conversion rules
